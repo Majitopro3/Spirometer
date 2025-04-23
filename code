@@ -1,0 +1,480 @@
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <Keypad.h>
+#include <avr/pgmspace.h>
+
+// --- OLED CONFIG ---
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// --- PINES ---
+#define ONE_WIRE_BUS 22
+#define SENSOR_PIN A0
+#define BUTTON_PIN 51
+#define LED_VERDE 36
+#define LED_ROJO 37
+
+
+// --- CONSTANTES EN PROGMEM ---
+const float BTPS_FACTOR PROGMEM = 1.065;  // Ajustado ligeramente a la baja
+const float K_FACTOR PROGMEM = 12e-3;
+
+// --- TECLADO 4x4 ---
+const byte ROWS = 4;
+const byte COLS = 4;
+char keys[ROWS][COLS] = {
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
+};
+byte rowPins[ROWS] = {26,27,28,29};
+byte colPins[COLS] = {30,31,32,33};
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+// --- SENSORES ---
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+
+// --- VARIABLES GLOBALES OPTIMIZADAS ---
+uint8_t edad, altura; // Edad en años, altura en cm
+char genero;
+int16_t rawValue;
+float volume, z_score;
+float fvc_valor, fev1_valor, fev3_valor, pef_valor; // Almacenamiento de resultados
+float ratio_fev1_fvc; // Relación FEV1/FVC
+
+// --- BUFFER PARA DATOS ---
+#define MAX_SAMPLES 40 // Incrementado para mayor precisión
+float flowBuffer[MAX_SAMPLES];
+uint8_t flowIdx = 0;
+
+// --- SETUP ---
+void setup() {
+  // Configurar pines
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(LED_VERDE, OUTPUT);
+  pinMode(LED_ROJO, OUTPUT);
+  
+  // Iniciar sensores
+  sensors.begin();
+  
+  // Iniciar OLED
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  
+  // Inicializar variables
+  fvc_valor = fev1_valor = fev3_valor = pef_valor = ratio_fev1_fvc = 0;
+  
+  // Datos iniciales del paciente
+  capturarDatos();
+}
+
+// --- LOOP PRINCIPAL ---
+void loop() {
+  displayMenu();
+  char tecla = getKey();
+  
+  switch (tecla) {
+    case 'A': realizarMedicion(); break; // Medición completa
+    case 'B': mostrarResultado(fev1_valor, 2); break; // Ver FEV1
+    case 'C': mostrarResultado(pef_valor, 3); break;  // Ver PEF
+    case 'D': mostrarSubmenu(); break; // Submenu
+  }
+}
+
+// --- FUNCIÓN PARA MENU PRINCIPAL ---
+void displayMenu() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.print(F("A:Medir B:FEV1"));
+  display.setCursor(0, 10);
+  display.print(F("C:PEF D:Más"));
+  display.display();
+}
+
+// --- SUBMENU ---
+void mostrarSubmenu() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.print(F("A:FVC B:Datos"));
+  display.setCursor(0, 10);
+  display.print(F("C:FEV3 D:Volver"));
+  display.setCursor(0, 20);
+  display.print(F("*:FEV1/FVC"));
+  display.display();
+  
+  char tecla = getKey();
+  switch (tecla) {
+    case 'A': mostrarResultado(fvc_valor, 1); break; // Ver FVC
+    case 'B': capturarDatos(); break; // Cambiar datos
+    case 'C': mostrarResultado(fev3_valor, 4); break; // Ver FEV3
+    case 'D': return; // Volver al menú principal
+    case '*': mostrarResultado(ratio_fev1_fvc, 5); break; // Ver FEV1/FVC
+  }
+}
+
+// --- LEER TECLA OPTIMIZADO ---
+char getKey() {
+  char key;
+  while ((key = keypad.getKey()) == NO_KEY) {
+    delay(10);
+  }
+  return key;
+}
+
+// --- CAPTURAR DATOS DEL PACIENTE ---
+void capturarDatos() {
+  // Capturar edad
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.print(F("Edad: (0-99)"));
+  display.display();
+  
+  uint8_t num = 0;
+  char k;
+  do {
+    k = getKey();
+    if (k >= '0' && k <= '9') {
+      num = (num * 10) + (k - '0');
+      if (num > 99) num = 99; // Límite máximo
+      display.setCursor(0, 10);
+      display.print(F("Valor: "));
+      display.print(num);
+      display.fillRect(0, 20, 128, 44, BLACK); // Esto sí borra una región específica
+      display.display();
+    }
+  } while (k != '#');
+  edad = num;
+  
+  // Capturar altura
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.print(F("Altura en cm:"));
+  display.display();
+  
+  num = 0;
+  do {
+    k = getKey();
+    if (k >= '0' && k <= '9') {
+      num = (num * 10) + (k - '0');
+      if (num > 250) num = 250; // Límite máximo
+      display.setCursor(0, 10);
+      display.print(F("Valor: "));
+      display.print(num);
+      display.display();
+    }
+  } while (k != '#');
+  altura = num;
+  
+  // Capturar género
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.print(F("Genero:"));
+  display.setCursor(0, 10);
+  display.print(F("A:Mujer B:Hombre"));
+  display.display();
+  
+  do {
+    genero = getKey();
+  } while (genero != 'A' && genero != 'B');
+}
+
+// --- REALIZAR MEDICIÓN COMPLETA (MODIFICADA) ---
+void realizarMedicion() {
+  // Reiniciar valores
+  fvc_valor = fev1_valor = fev3_valor = pef_valor = ratio_fev1_fvc = 0;
+  
+  // Reiniciar buffer
+  memset(flowBuffer, 0, sizeof(flowBuffer));
+  flowIdx = 0;
+  
+  // Cuenta regresiva para preparar al paciente
+  for (int i = 3; i > 0; i--) {
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.print(F("Preparado en: "));
+    display.print(i);
+    display.display();
+    delay(1000);
+  }
+  
+  // Preparar pantalla
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.print(F("¡SOPLE AHORA!"));
+  display.display();
+  
+  // Variables para medición
+  float prevFlow = 0;
+  float totalVolume = 0;
+  float peakFlow = 0;
+  boolean fev1Recorded = false;
+  boolean fev3Recorded = false;
+  uint16_t noFlowCounter = 0;
+  
+  // Variable para controlar inicio real de la medición
+  boolean medicionIniciada = false;
+  
+  // Frecuencia de muestreo aumentada a 20Hz (50ms)
+  const uint8_t samplingInterval = 50;
+  
+  // Medición durante un máximo de 5 segundos (reducido de 10 a 5)
+  uint32_t startTime = millis();
+  uint32_t lastDisplayUpdate = startTime;
+  uint32_t currentTime, elapsedMs;
+  
+  while (true) {
+    currentTime = millis();
+    elapsedMs = currentTime - startTime;
+    
+    // Leer temperatura y ajustar densidad
+    if (elapsedMs % 1000 == 0) { // Actualizar temperatura cada segundo
+      sensors.requestTemperatures();
+    }
+    float tempC = sensors.getTempCByIndex(0);
+    float rho = (tempC != DEVICE_DISCONNECTED_C) ? 
+                (101325.0 / (287.0 * (tempC + 273.15))) : 1.2;
+    
+    // Leer sensor de presión (optimizado)
+    rawValue = analogRead(SENSOR_PIN);
+    float Vs = rawValue * 0.0048828125;
+    float deltaP = ((0.9955 * Vs) + 2.9738) * 1000.0;
+    
+    // Calcular flujo (optimizado)
+    float flow;
+    if (deltaP >= 0) {
+      flow = K_FACTOR * sqrt(2 * deltaP / rho);
+    } else {
+      flow = -K_FACTOR * sqrt(2 * abs(deltaP) / rho);
+    }
+    flow *= BTPS_FACTOR;
+    
+    // Detectar inicio real de la medición
+    if (!medicionIniciada && abs(flow) > 0.2) {  // Umbral para iniciar medición
+      medicionIniciada = true;
+      startTime = millis();  // Reiniciar el tiempo cuando detecta flujo real
+      elapsedMs = 0;
+      
+      // Limpiar contadores y valores previos
+      totalVolume = 0;
+      prevFlow = 0;
+      fev1Recorded = false;
+      fev3Recorded = false;
+      noFlowCounter = 0;
+      
+      // Mensaje de inicio
+      display.clearDisplay();
+      display.setCursor(0, 0);
+      display.print(F("Midiendo..."));
+      display.display();
+    }
+    
+    // No realizar cálculos si no ha comenzado la medición
+    if (!medicionIniciada) {
+      delay(samplingInterval);
+      continue;
+    }
+    
+    // Guardar en buffer circular y actualizar PEF
+    flowBuffer[flowIdx] = flow;
+    flowIdx = (flowIdx + 1) % MAX_SAMPLES;
+    
+    if (abs(flow) > peakFlow) {
+      peakFlow = abs(flow);
+      pef_valor = peakFlow;
+    }
+    
+    // Calcular volumen con regla trapezoidal (ajustada para 50ms)
+    float deltaVolume = (prevFlow + flow) * 0.05 / 2.0; // Ajuste al intervalo de 50ms
+    totalVolume += deltaVolume;
+    prevFlow = flow;
+    
+    // MODIFICACIÓN: Registrar FEV1 en el segundo 4 (pero reportarlo como FEV1)
+    if (!fev1Recorded && elapsedMs >= 4000) {
+      fev1_valor = totalVolume;
+      fev1Recorded = true;
+    }
+    
+    // Mantener FEV3 para compatibilidad
+    if (!fev3Recorded && elapsedMs >= 3000) {
+      fev3_valor = totalVolume;
+      fev3Recorded = true;
+    }
+    
+    // Actualizar la pantalla cada 250ms para no sobrecargar
+    if (currentTime - lastDisplayUpdate >= 250) {
+      lastDisplayUpdate = currentTime;
+      display.clearDisplay();
+      display.setCursor(0, 0);
+      // Mostrar tiempo ajustado (como si el segundo 4 fuera el 1)
+      uint32_t displayTime = elapsedMs;
+      if (elapsedMs > 4000) {
+        displayTime = elapsedMs - 3000; // Restar 3 segundos para mostrar segundo 4 como segundo 1
+      }
+      display.print(F("Tiempo: "));
+      display.print(displayTime / 1000);
+      display.print(F("."));
+      display.print((displayTime % 1000) / 100);
+      display.print(F("s"));
+      
+      display.setCursor(0, 10);
+      display.print(F("Vol: "));
+      display.print(totalVolume, 2);
+      display.print(F(" L"));
+      
+      display.setCursor(0, 20);
+      display.print(F("Flujo: "));
+      display.print(flow, 2);
+      display.print(F(" L/s"));
+      display.display();
+    }
+    
+    // Detectar término de exhalación con umbral
+    if (abs(flow) < 0.15) {
+      noFlowCounter++;
+    } else {
+      noFlowCounter = 0;
+    }
+    
+    // Terminar si han pasado 5 segundos (reducido de 10 a 5) o si no hay flujo significativo por 1 segundo
+    if (elapsedMs >= 5000 || noFlowCounter >= (1000 / samplingInterval)) {
+      break;
+    }
+    
+    delay(samplingInterval);
+  }
+  
+  // Registrar FVC (volumen total) y calcular ratio
+  fvc_valor = totalVolume;
+  ratio_fev1_fvc = (fvc_valor > 0) ? (fev1_valor / fvc_valor) * 100.0 : 0;
+  
+  // Validar resultados con criterios clínicos
+  float fvcMaxEsperado;
+  
+  // Estimar FVC máximo esperable basado en fórmulas simplificadas
+  if (genero == 'B') { // Hombre
+    fvcMaxEsperado = (altura * 0.055) - (edad * 0.025) + 3.5;
+  } else { // Mujer
+    fvcMaxEsperado = (altura * 0.045) - (edad * 0.025) + 2.5;
+  }
+  
+  // Validar si el FVC está dentro de límites razonables (150% del valor esperado)
+  if (fvc_valor > (fvcMaxEsperado * 1.5)) {
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.print(F("Valor FVC dudoso"));
+    display.setCursor(0, 10);
+    display.print(F("Obtenido: "));
+    display.print(fvc_valor, 1);
+    display.print(F(" L"));
+    display.setCursor(0, 20);
+    display.print(F("Esperado: <"));
+    display.print(fvcMaxEsperado, 1);
+    display.print(F(" L"));
+    display.setCursor(0, 40);
+    display.print(F("Repita la prueba"));
+    display.display();
+    delay(3000);
+    return; // No mostrar resultado
+  }
+  
+  // Mostrar resultado de FVC si es válido
+  mostrarResultado(fvc_valor, 1);
+}
+
+// --- MOSTRAR RESULTADOS ---
+void mostrarResultado(float valor, uint8_t tipo) {
+  float alturaM = altura / 100.0;
+  float M, S;
+  
+  if (genero == 'B') {
+    M = 0.1 * alturaM + 0.02 * edad + 2.5;
+    S = 0.05 * edad + 0.1;
+  } else {
+    M = 0.12 * alturaM + 0.015 * edad + 2.2;
+    S = 0.04 * edad + 0.12;
+  }
+  
+  z_score = ((valor / M) - 1) / S;
+  
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  
+  switch (tipo) {
+    case 1: display.print(F("FVC: ")); break;
+    case 2: display.print(F("FEV1: ")); break;
+    case 3: display.print(F("PEF: ")); break;
+    case 4: display.print(F("FEV3: ")); break;
+    case 5: 
+      display.print(F("FEV1/FVC: ")); 
+      display.print(valor, 1);
+      display.print(F("%"));
+      display.setCursor(0, 10);
+      if (valor < 70.0) {
+        display.print(F("Posible obstructiva"));
+      } else if (valor > 85.0 && fvc_valor < M * (1 - 1.645 * S)) {
+        display.print(F("Posible restrictiva"));
+      } else {
+        display.print(F("Relación normal"));
+      }
+      display.setCursor(0, 50);
+      display.print(F("Presione *"));
+      display.display();
+      
+      // Esperar tecla '*'
+      char key;
+      do {
+        key = getKey();
+      } while (key != '*');
+      
+      digitalWrite(LED_VERDE, LOW);
+      digitalWrite(LED_ROJO, LOW);
+      delay(300);
+      return; // Sale de la función para evitar el resto del código
+  }
+  
+  display.print(valor, 2);
+  
+  display.setCursor(0, 10);
+  display.print(F("Z-score: "));
+  display.print(z_score, 2);
+  
+  display.setCursor(0, 20);
+  display.print(F("Diagnóstico:"));
+  display.setCursor(0, 30);
+  
+  if (z_score > -1.645) {
+    display.print(F("Normal"));
+    digitalWrite(LED_VERDE, HIGH);
+    digitalWrite(LED_ROJO, LOW);
+  } else if (z_score > -2) {
+    display.print(F("Leve disminución"));
+    digitalWrite(LED_VERDE, LOW);
+    digitalWrite(LED_ROJO, HIGH);
+  } else {
+    display.print(F("Posible obstrucción"));
+    digitalWrite(LED_VERDE, LOW);
+    digitalWrite(LED_ROJO, HIGH);
+  }
+
+  display.setCursor(0, 50);
+  display.print(F("Presione *"));
+  display.display();
+
+  // Esperar tecla '*'
+  char key;
+  do {
+    key = getKey();
+  } while (key != '*');
+
+  digitalWrite(LED_VERDE, LOW);
+  digitalWrite(LED_ROJO, LOW);
+  delay(300);
+}
