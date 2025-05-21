@@ -1,0 +1,484 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <math.h>
+#include <ESP8266WiFi.h>
+#include <ThingSpeak.h>
+
+// Configuración WiFi
+const char* ssid = "NAVARRO SANCHEZ";
+const char* password = "03201800";
+
+// Configuración ThingSpeak
+unsigned long thingSpeakChannelID = 2950800; // Reemplazar con tu ID de canal
+const char* thingSpeakAPIKey = "QPJWHDPKU51HLWGQ"; // Reemplazar con tu API Key
+WiFiClient client;
+
+// Pines OLED personalizados - Usar D6 (GPIO12) y D7 (GPIO13) para ESP8266
+#define I2C_SDA 4 // GPIO12
+#define I2C_SCL 5  // GPIO13
+
+// Configuración de la pantalla - usar Wire estándar para ESP8266
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// Pines del sensor y LEDs
+const int pressurePin = A0; // Pin analógico para ESP8266
+const int ledVerde = 13;    // Puede ser cualquier pin digital disponible
+const int ledRojo = 15;     // Puede ser cualquier pin digital disponible
+
+// Parámetros físicos del neumotacógrafo
+const float TUBO_RADIO = 0.01;  // Radio del tubo en metros (1 cm)
+const float TUBO_LONGITUD = 0.06;  // Longitud del tubo en metros (6 cm)
+const float VISCOSIDAD_AIRE = 1.81e-7;  // Viscosidad dinámica del aire a 20°C en Pa·s
+
+// Constantes derivadas de la ecuación
+const float FACTOR_FLUJO = (M_PI * pow(TUBO_RADIO, 4)) / (8 * VISCOSIDAD_AIRE * TUBO_LONGITUD);
+
+// Variables para medición
+float voltage = 0.0;
+float pressure = 0.0;
+float pressureDiff = 0.0;  // Diferencia de presión en Pa
+float flow = 0.0;
+float volume = 0.0;
+float FVC = 0.0;
+float FEV1 = 0.0;
+float FEV4 = 0.0;
+float PEF = 0.0;
+
+unsigned long startTime;
+unsigned long prevTime;
+unsigned long lastThingSpeakUpdate = 0;
+const unsigned long thingSpeakInterval = 15000; // 15 segundos entre actualizaciones
+
+// Variables para el control de estados
+bool exhalando = false;
+bool preparandoExhalacion = false;
+bool cuentaRegresivaActiva = false;
+bool resultadosMostrados = false;
+float maxFlow = 0.0;
+
+// Duración EXACTA de la exhalación (6 segundos)
+const unsigned long DURACION_EXHALACION = 6000; // 6 segundos en milisegundos
+
+// Variables para la cuenta regresiva
+int cuentaRegresiva = 5; // 5 segundos de cuenta regresiva
+unsigned long tiempoCuentaRegresiva = 0;
+
+// Temporizador para auto-inicio de la prueba
+unsigned long tiempoPreparacion = 0;
+const unsigned long TIEMPO_ESPERA_INICIO = 5000; // 5 segundos antes de iniciar automáticamente
+
+// Datos del paciente (pueden ser ajustados manualmente)
+int edad = 25;
+float altura = 1.75; // en metros
+char sexo = 'M';
+
+// Valores LMS ficticios (solo para prueba, reemplazar con datos reales de GLI si se desea más precisión)
+float L = -0.2;
+float M = 4.5;
+float S = 0.25;
+
+float calcularZScore(float medido, float L, float M, float S) {
+  if (L == 0) {
+    return log(medido / M) / S;
+  } else {
+    return (pow(medido / M, L) - 1) / (L * S);
+  }
+}
+
+void conectarWiFi() {
+  Serial.print("Conectando a WiFi");
+  WiFi.begin(ssid, password);
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    
+    // Mostrar mensaje de conexión en la pantalla OLED
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(SSD1306_WHITE);
+    display.setCursor(0, 0);
+    display.println("Conectando a WiFi...");
+    display.display();
+  }
+  
+  Serial.println("");
+  Serial.println("Conectado a WiFi");
+  
+  // Mostrar mensaje de conexión exitosa en OLED
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("WiFi conectado!");
+  display.println(WiFi.localIP());
+  display.display();
+  delay(2000);
+  
+  // Inicializar ThingSpeak
+  ThingSpeak.begin(client);
+}
+
+void enviarDatosThingSpeak() {
+  // Asignar valores a los campos de ThingSpeak
+  ThingSpeak.setField(1, FVC);
+  ThingSpeak.setField(2, FEV1);
+  ThingSpeak.setField(3, FEV4);
+  ThingSpeak.setField(4, PEF);
+  
+  // Calcular Z-scores
+  float zFVC = calcularZScore(FVC, L, M, S);
+  float zFEV1 = calcularZScore(FEV1, L, M, S);
+  
+  ThingSpeak.setField(5, zFVC);
+  ThingSpeak.setField(6, zFEV1);
+  
+  // Enviar datos a ThingSpeak
+  int resultado = ThingSpeak.writeFields(thingSpeakChannelID, thingSpeakAPIKey);
+  
+  if(resultado == 200) {
+    Serial.println("Datos enviados a ThingSpeak correctamente");
+    
+    // Mostrar confirmación en OLED
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.println("Datos enviados a");
+    display.println("ThingSpeak!");
+    display.display();
+    delay(2000);
+  }
+  else {
+    Serial.println("Error enviando datos a ThingSpeak. Código: " + String(resultado));
+    
+    // Mostrar error en OLED
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.println("Error enviando datos");
+    display.println("Código: " + String(resultado));
+    display.display();
+    delay(2000);
+  }
+  
+  lastThingSpeakUpdate = millis();
+}
+
+void mostrarResultados() {
+  // Mostrar resultados en la pantalla OLED
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.printf("FVC: %.2f L\n", FVC);
+  display.printf("FEV1: %.2f L\n", FEV1);
+  display.printf("FEV4: %.2f L\n", FEV4);
+  display.printf("PEF: %.2f L/s\n", PEF);
+  float zFVC = calcularZScore(FVC, L, M, S);
+  float zFEV1 = calcularZScore(FEV1, L, M, S);
+  display.printf("Z-FVC: %.2f\n", zFVC);
+  display.printf("Z-FEV1: %.2f\n", zFEV1);
+  display.setCursor(0, 56);
+  display.println("Presione para nueva prueba");
+  display.display();
+
+  // También mostrar datos en el monitor serial para depuración
+  Serial.println("=== RESULTADOS DE ESPIROMETRÍA ===");
+  Serial.printf("FVC: %.2f L\n", FVC);
+  Serial.printf("FEV1: %.2f L\n", FEV1); 
+  Serial.printf("FEV4: %.2f L\n", FEV4);
+  Serial.printf("PEF: %.2f L/s\n", PEF);
+  Serial.printf("Z-FVC: %.2f\n", zFVC);
+  Serial.printf("Z-FEV1: %.2f\n", zFEV1);
+  Serial.println("================================");
+
+  // Diagnóstico simple
+  if (zFEV1 < -1.64) {
+    digitalWrite(ledRojo, HIGH);
+    digitalWrite(ledVerde, LOW);
+    Serial.println("ALERTA: Posible obstrucción de vías respiratorias");
+  } else {
+    digitalWrite(ledRojo, LOW);
+    digitalWrite(ledVerde, HIGH);
+    Serial.println("NORMAL: Función pulmonar dentro de parámetros normales");
+  }
+  
+  // Enviar datos a ThingSpeak si ha pasado suficiente tiempo
+  if (millis() - lastThingSpeakUpdate > thingSpeakInterval) {
+    enviarDatosThingSpeak();
+  }
+}
+
+void iniciarCuentaRegresiva() {
+  cuentaRegresivaActiva = true;
+  cuentaRegresiva = 5;
+  tiempoCuentaRegresiva = millis();
+  preparandoExhalacion = false;
+  
+  display.clearDisplay();
+  display.setTextSize(3);
+  display.setCursor(60, 20);
+  display.print(cuentaRegresiva);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Prepárese para exhalar");
+  display.setCursor(0, 50);
+  display.println("Inhale profundamente...");
+  display.display();
+  
+  // Activar señal auditiva/visual para indicar inicio de cuenta regresiva
+  // Por ejemplo, parpadear el LED verde
+  digitalWrite(ledVerde, HIGH);
+  delay(200);
+  digitalWrite(ledVerde, LOW);
+}
+
+void actualizarCuentaRegresiva() {
+  unsigned long currentTime = millis();
+  
+  // Actualizar cada segundo
+  if (currentTime - tiempoCuentaRegresiva >= 1000) {
+    cuentaRegresiva--;
+    tiempoCuentaRegresiva = currentTime;
+    
+    if (cuentaRegresiva > 0) {
+      // Mostrar la cuenta regresiva
+      display.clearDisplay();
+      display.setTextSize(3);
+      display.setCursor(60, 20);
+      display.print(cuentaRegresiva);
+      display.setTextSize(1);
+      display.setCursor(0, 0);
+      display.println("Prepárese para exhalar");
+      display.setCursor(0, 50);
+      display.println("Inhale profundamente...");
+      display.display();
+      
+      // Señal auditiva/visual en cada segundo de la cuenta regresiva
+      // Por ejemplo, parpadear el LED verde
+      digitalWrite(ledVerde, HIGH);
+      delay(100);
+      digitalWrite(ledVerde, LOW);
+    } else {
+      // Cuenta regresiva terminada, iniciar exhalación
+      display.clearDisplay();
+      display.setTextSize(2);
+      display.setCursor(0, 20);
+      display.println("¡EXHALE!");
+      display.setTextSize(1);
+      display.setCursor(0, 45);
+      display.println("Exhale con fuerza durante");
+      display.println("6 segundos COMPLETOS");
+      display.display();
+      
+      // Señal auditiva/visual para indicar que debe exhalar
+      // Por ejemplo, encender el LED verde
+      digitalWrite(ledVerde, HIGH);
+      
+      // Preparar para iniciar medición
+      cuentaRegresivaActiva = false;
+      exhalando = true;
+      volume = 0;
+      FVC = 0;
+      FEV1 = 0;
+      FEV4 = 0;
+      PEF = 0;
+      maxFlow = 0;
+      startTime = currentTime;
+      prevTime = startTime;
+    }
+  }
+}
+
+void prepararNuevaPrueba() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Preparando nueva prueba");
+  display.println("de espirometría");
+  display.println("");
+  display.println("La prueba iniciará");
+  display.println("automáticamente en 5s");
+  display.display();
+  
+  preparandoExhalacion = true;
+  tiempoPreparacion = millis();
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(ledVerde, OUTPUT);
+  pinMode(ledRojo, OUTPUT);
+
+  Serial.println("Inicializando sistema de espirometría con neumotacógrafo");
+  Serial.printf("Radio del tubo: %.2f cm\n", TUBO_RADIO * 100);
+  Serial.printf("Longitud del tubo: %.2f cm\n", TUBO_LONGITUD * 100);
+  Serial.printf("Factor de conversión flujo: %.6f\n", FACTOR_FLUJO);
+  Serial.println("Duración de exhalación: 6 segundos EXACTOS");
+
+  // Inicializar pantalla OLED
+  Wire.begin(I2C_SDA, I2C_SCL);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("No se encontró la pantalla OLED"));
+    while (true);
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Inicializando...");
+  display.println("Espirometro");
+  display.printf("R=%.1fcm L=%.1fcm\n", TUBO_RADIO*100, TUBO_LONGITUD*100);
+  display.println("Exhalación: 6s EXACTOS");
+  display.display();
+  delay(2000);
+  
+  // Conectar a WiFi e inicializar ThingSpeak
+  conectarWiFi();
+  
+  // Iniciar directamente la preparación para la primera prueba
+  prepararNuevaPrueba();
+}
+
+void loop() {
+  // Comprobar estado de WiFi y reconectar si es necesario
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Reconectando a WiFi...");
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("Reconectando WiFi...");
+    display.display();
+    WiFi.disconnect();
+    WiFi.begin(ssid, password);
+    
+    // Esperar reconexión (con timeout)
+    unsigned long startAttempt = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 10000) {
+      delay(500);
+      Serial.print(".");
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\nReconectado a WiFi");
+    } else {
+      Serial.println("\nFallo en reconexión WiFi");
+    }
+  }
+  
+  // Leer el sensor de presión
+  voltage = analogRead(pressurePin) * (3.3 / 1023.0); // ESP8266 ADC (0-1023)
+  
+  // Convertir el voltaje a diferencia de presión en Pascales
+  // Suponiendo que el sensor da 0V para 0Pa y 3.3V para presión máxima (ejemplo: 500 Pa)
+  pressureDiff = voltage * (500.0 / 3.3);
+  
+  // Calcular el flujo usando la ecuación del neumotacógrafo: φ = πR⁴|P1-P2|/(8μL)
+  flow = FACTOR_FLUJO * pressureDiff;
+  
+  // Si el flujo es muy pequeño, considerarlo como 0 para evitar ruido
+  if (flow < 0.05) flow = 0;
+
+  // Manejo de estados
+  if (preparandoExhalacion) {
+    // Mostrar el tiempo restante para comenzar la prueba
+    unsigned long tiempoTranscurrido = millis() - tiempoPreparacion;
+    unsigned long segundosRestantes = (TIEMPO_ESPERA_INICIO - tiempoTranscurrido) / 1000;
+    
+    // Actualizar la pantalla cada segundo durante la preparación
+    if (tiempoTranscurrido % 1000 < 50) {
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setCursor(0, 0);
+      display.println("Preparando nueva prueba");
+      display.println("de espirometría");
+      display.println("");
+      display.println("La prueba iniciará");
+      display.printf("automáticamente en %ds\n", segundosRestantes + 1);
+      display.display();
+    }
+    
+    // Después del tiempo de preparación, iniciar cuenta regresiva
+    if (tiempoTranscurrido >= TIEMPO_ESPERA_INICIO) {
+      iniciarCuentaRegresiva();
+    }
+  } 
+  else if (cuentaRegresivaActiva) {
+    actualizarCuentaRegresiva();
+  }
+  else if (exhalando) {
+    unsigned long currentTime = millis();
+    float dt = (currentTime - prevTime) / 1000.0;
+    prevTime = currentTime;
+    volume += flow * dt;
+
+    // Calcular FEV1 y FEV4 con precisión
+    if ((currentTime - startTime) <= 1000) FEV1 = volume;
+    if ((currentTime - startTime) <= 4000) FEV4 = volume;
+
+    if (flow > maxFlow) maxFlow = flow;
+
+    // Mostrar tiempo restante durante la exhalación
+    unsigned long tiempoTranscurrido = currentTime - startTime;
+    unsigned long tiempoRestante = (tiempoTranscurrido < DURACION_EXHALACION) ? 
+                                   (DURACION_EXHALACION - tiempoTranscurrido) / 1000 : 0;
+    
+    // Actualizar display cada 200ms durante la exhalación para mayor frecuencia de actualización
+    if (currentTime % 200 < 50) {
+      display.clearDisplay();
+      display.setCursor(0, 0);
+      display.println("Exhalando...");
+      display.printf("Vol: %.2f L\n", volume);
+      display.printf("Flujo: %.2f L/s\n", flow);
+      display.setTextSize(2);
+      display.setCursor(40, 30);
+      display.printf("%d s", tiempoRestante);
+      display.setTextSize(1);
+      display.setCursor(0, 55);
+      // Mensaje más enfático para exhalación completa
+      display.println("¡CONTINUE EXHALANDO!");
+      display.display();
+    }
+
+    // MODIFICACIÓN CLAVE: Finalizar la prueba SOLO cuando se cumplen los 6 segundos exactos
+    // Eliminamos la condición de finalización por flujo bajo
+    if (tiempoTranscurrido >= DURACION_EXHALACION) {
+      // Emitir señal sonora/visual al terminar (opcional)
+      digitalWrite(ledVerde, LOW);
+      digitalWrite(ledRojo, HIGH);
+      delay(100);
+      digitalWrite(ledRojo, LOW);
+      
+      FVC = volume;  // Capacidad vital forzada es el volumen total exhalado
+      PEF = maxFlow; // Flujo espiratorio máximo
+      exhalando = false;
+      resultadosMostrados = true;
+      
+      // Indicar que la prueba ha terminado
+      display.clearDisplay();
+      display.setCursor(0, 0);
+      display.println("¡Prueba completada!");
+      display.println("6 segundos registrados");
+      display.println("Procesando resultados...");
+      display.display();
+      delay(1000);
+      
+      mostrarResultados();
+      
+      // Enviar datos a ThingSpeak inmediatamente
+      enviarDatosThingSpeak();
+    }
+  }
+  else if (resultadosMostrados) {
+    // Mantener los resultados en pantalla hasta que se presione el sensor
+    if (flow > 0.2) { // Umbral ligeramente más alto para evitar falsos positivos
+      delay(1000); // Debounce para evitar detecciones múltiples
+      resultadosMostrados = false;
+      prepararNuevaPrueba();
+    }
+  }
+  
+  delay(10); // Pequeña pausa para estabilidad
+}
